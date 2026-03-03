@@ -1,0 +1,1314 @@
+================================================================================
+UMVC3 RECOMP - RALPH LOOP KNOWLEDGE BASE
+Última atualização: 2026-03-02 (sessão 9 - diagnóstico stale write_ptr; fix pendente)
+================================================================================
+
+================================================================================
+1. VISÃO GERAL DO PROJETO
+================================================================================
+
+Objetivo: Recompilar Ultimate Marvel vs. Capcom 3 (Xbox 360 / PPC) para rodar
+nativamente em PC Windows usando o RexGlue SDK (codegen de PPC → C++ nativo).
+
+- Engine do jogo: MT Framework (Capcom)
+- Plataforma original: Xbox 360 (PowerPC Big-Endian)
+- SDK de recompilação: RexGlue SDK
+- XEX de referência: d:\Recomp\assets\default.xex
+- Emulador de referência: Xenia (d:\Recomp\xenia.log confirma que o jogo roda)
+- Ambiente WINDOWS COM POWERSHELL!
+- NÃO UTILIZE CMAKE TOOLS EXTENSION, SEMPRE POWERSHELL.
+
+================================================================================
+2. ESTRUTURA DO PROJETO
+================================================================================
+
+d:\Recomp\
+├── CMakeLists.txt               <- build principal (SDK-managed)
+├── CMakePresets.json
+├── umvc3_recomp_config.toml     <- config do codegen
+├── assets/
+│   ├── default.xex              <- XEX do jogo (Xbox 360)
+│   ├── Image                    <- hard link para default.xex (STFS verification)
+│   └── nativeXenon/             <- dados nativos do jogo
+├── generated/                   <- código gerado pelo codegen (NÃO EDITAR)
+│   ├── sources.cmake
+│   ├── umvc3_recomp_config.h
+│   ├── umvc3_recomp_init.cpp/h
+│   └── umvc3_recomp_recomp.*.cpp
+├── src/
+│   ├── main.cpp                 <- entry point, stubs, overrides
+│   └── bdengine/
+│       ├── bd_init.h/cpp
+│       ├── heap.h/cpp
+│       ├── file_hooks.cpp       <- hooks de I/O nativos (CreateFileA, NtCreateFile...)
+│       ├── file_cache.cpp
+│       ├── ramdisk.cpp
+│       ├── keybinds.cpp
+│       ├── game_patches.cpp
+│       ├── render_hooks.cpp
+│       └── overlay/
+├── rexglu/                      <- SDK pré-compilado (NÃO EDITAR)
+│   ├── include/
+│   └── lib/
+├── rexglue-sourceCODE/          <- source do SDK (referência apenas)
+├── dlmalloc/
+└── ref/                         <- projetos de referência (RB2, reblue)
+
+================================================================================
+3. COMANDOS ESSENCIAIS
+================================================================================
+NÃO BUILDAR COM CMAKE TOOLS EXTENSION, BUILDAR NO TERMINAL
+--- BUILD ---
+cmake --build d:\Recomp\out\build\win-amd64-debug
+
+--- BUILD (checar só erros) ---
+cmake --build d:\Recomp\out\build\win-amd64-debug 2>&1 | Select-String "error:" | Select-Object -First 20
+
+--- EXECUTAR (simples) ---
+cd d:\Recomp
+.\out\build\win-amd64-debug\umvc3_recomp.exe "d:\Recomp\assets"
+
+--- EXECUTAR (com log debug) ---
+cd d:\Recomp
+Start-Process -FilePath ".\out\build\win-amd64-debug\umvc3_recomp.exe" `
+  -ArgumentList '"d:\Recomp\assets"','--log_file','d:\Recomp\recomp.log','--log_level','debug' `
+  -NoNewWindow -Wait
+
+--- LER LOG (últimas linhas) ---
+Get-Content d:\Recomp\recomp.log | Select-Object -Last 80
+
+--- LER LOG (filtrar erros) ---
+Get-Content d:\Recomp\recomp.log | Select-String "error|FAILED|assert|WARN|unhandled"
+
+--- CODEGEN (se precisar regenerar) ---
+cmake --build d:\Recomp\out\build\win-amd64-debug --target umvc3_recomp_codegen
+
+================================================================================
+4. ARQUITETURA DE RUNTIME
+================================================================================
+
+Fluxo de execução:
+  umvc3_recomp.exe
+    └── REX_DEFINE_APP -> Umvc3RecompApp::Create
+          ├── OnBeforeLoadXex()    <- VFS symlinks, stubs XAM/xboxkrnl
+          ├── [rexkerneld carrega default.xex]
+          └── OnPostSetup()        <- heap, file hooks, object type patching
+
+Como os imports PPC funcionam:
+  - O código gerado chama __imp__NtCreateFile(ctx, base) como símbolo C++ direto
+  - rexkerneld.lib fornece implementações padrão desses símbolos
+  - Para OVERRIDE: definir PPC_FUNC_IMPL(x) ou PPC_HOOK(x, fn) no nosso .obj
+    -> lld-link usa a PRIMEIRA definição encontrada (objeto > lib)
+  - /FORCE:MULTIPLE no CMakeLists.txt permite múltiplas definições (nossa ganha)
+
+Macros disponíveis (rex/ppc/function.h):
+  PPC_FUNC_IMPL(x)        -> extern "C" void x(PPCContext& ctx, uint8_t* base)
+  PPC_HOOK(sym, fn)        -> wrapper que chama HostToGuestFunction<fn>
+  PPC_STUB(sym)            -> stub que loga e retorna 0
+  PPC_STUB_RETURN(sym, v)  -> stub que retorna valor fixo
+
+Tipos PPC (rex/ppc/types.h):
+  ppc_u32_t, ppc_u32_result_t, ppc_pvoid_t, ppc_ptr_t<T>
+
+================================================================================
+5. VFS (Virtual File System) - COMPORTAMENTO CRÍTICO
+================================================================================
+
+IMPORTANTE: rexkerneld.lib divide paths ANTES de resolver symlinks:
+  \Device\Image  ->  device="\Device", path="Image"
+  A symlink em "\Device\Image" NUNCA é consultada!
+
+Paths que o jogo usa -> como mapeamos:
+  \Device\Image                  -> g_game_dir/default.xex    (TranslatePath)
+  \Device\Harddisk0\Partition1\* -> g_game_dir/*              (HostPathDevice via SDK)
+  \Device\Harddisk0\partition0   -> g_game_dir               (TranslatePath, FAILED ok)
+  game:\*                        -> assets/*                  (automático pelo SDK)
+  d:\* / D:\*                    -> assets/*                  (symlink d: → game:)
+  d:\nativeXenon\*               -> assets/nativeXenon/*      (via expansão game:\nativeXenon\*)
+
+Symlinks registradas em OnBeforeLoadXex() E re-registradas em OnPostSetup():
+  d:           -> game:             ← CRÍTICO: NÃO game:\nativeXenon (causaria double!)
+  D:           -> game:             ← idem
+  \nativeXenon -> game:\nativeXenon
+  nativeXenon  -> game:\nativeXenon
+  \NATIVEXENON -> game:\nativeXenon
+  NATIVEXENON  -> game:\nativeXenon
+
+ATENÇÃO: O XEX loader (rexkerneld) re-registra d: → game:\nativeXenon durante o
+carregamento do XEX (disc info descriptor do header). Por isso O REGISTRO PRECISA
+SER REPETIDO EM OnPostSetup() após o XEX ter carregado, caso contrário o valor do
+loader sobrescreve o nosso OnBeforeLoadXex e volta a ter double-nativeXenon.
+
+BUG DOUBLE-NATIVEXENON (IDENTIFICADO NA SESSÃO 6):
+  Caminho do jogo:  d:\nativeXenon\sa\X360\root.arc
+  Com d: → game:\nativeXenon:  game:\nativeXenon\nativeXenon\sa\X360\root.arc ← ERRADO
+  Com d: → game:              game:\nativeXenon\sa\X360\root.arc ← CORRETO
+  Log VFS original: "VFS: 'd:\nativeXenon\sa\X360\root.arc' ->
+    '\Device\Harddisk0\Partition1\nativeXenon\nativeXenon\sa\X360\root.arc' -> [entry not found]"
+  root.arc EXISTE em d:\Recomp\assets\nativeXenon\sa\X360\root.arc
+
+NÃO registrar: \Device -> game:  (causa loop circular infinito e trava o boot!)
+
+================================================================================
+6. ORDINALS XBOXKRNL CONFIRMADOS
+================================================================================
+
+0x03  -> DbgPrint
+0x0E  -> ExEventObjectType          (variável)
+0x1B  -> ExThreadObjectType         (variável)
+0x3B  -> IoDismountVolume
+0x3C  -> IoDismountVolumeByFileHandle   <- stubado com 0xC000014F
+0x53  -> KeBugCheckEx               (NÃO é NtCreateFile! Era um bug histórico)
+0xD1  -> NtCreateEvent
+0xD2  -> NtCreateFile               <- overridado via __imp__NtCreateFile
+0xE8  -> NtQueryInformationFile     <- overridado completo (XFileBasicInfo, Standard, etc.)
+0xEF  -> NtQueryVolumeInformationFile   <- overridado (line 706 fix)
+0x100 -> NtDeviceIoControlFile      <- overridado (bypass IOCTL 0x24400 disc-auth)
+0x256 -> XeKeysConsolePrivateKeySign    <- stub retorna 0
+0x257 -> XeKeysConsoleSignatureVerification <- stub retorna 0
+0x259 -> StfsCreateDevice           <- STUB_S retorna 0
+0x25A -> StfsControlDevice          <- STUB_S retorna 0
+
+================================================================================
+7. PROBLEMAS RESOLVIDOS (HISTÓRICO)
+================================================================================
+
+[RESOLVIDO] NtDeviceIoControlFile IOCTL 0x24400 - disc auth
+  Sintoma: rexkerneld logava "unhandled IOCTL!" após abrir \Device\Image;
+           threads ficavam presas em 82F333F8 por ~5s aguardando resultado.
+  Causa: verificação STFS/disc-auth com código 0x24400; rexkerneld não implementa.
+  Fix: XNtDeviceIoControlFile_entry em file_hooks.cpp, bypass com STATUS_SUCCESS.
+  Arquivo: src/bdengine/file_hooks.cpp (PPC_HOOK __imp__NtDeviceIoControlFile)
+
+[RESOLVIDO] XeKeys 0x256/0x257 não implementados
+  Sintoma: funções de criptografia retornavam erro, logadas como unimplemented.
+  Causa: XeKeysConsolePrivateKeySign / XeKeysConsoleSignatureVerification ausentes.
+  Fix: stub_module("xboxkrnl", 0x256/0x257, 0) em OnBeforeLoadXex() em main.cpp.
+
+[RESOLVIDO] assert_always em xboxkrnl_io_info.cpp linha 344 (NtQueryInformationFile)
+  Sintoma: crash/assert no default: case de XFileFsInformationClass não suportada.
+  Causa: rexkerneld.lib não implementa os cases mais comuns (Basic, Standard, etc.)
+  Fix: override completo XNtQueryInformationFile_entry em file_hooks.cpp.
+  Arquivo: src/bdengine/file_hooks.cpp (PPC_HOOK __imp__NtQueryInformationFile)
+  Nota: file.h precisou de position() e file_size() helpers; +include rex/system/info/file.h
+
+[RESOLVIDO] OnInitialize override privado
+  Sintoma: erro de compilação
+  Fix: removido override inválido (OnInitialize é privado em rex::ReXApp)
+
+[RESOLVIDO] Loop circular VFS - programa travava após "Loading XEX image"
+  Sintoma: nenhuma janela, processo fica vivo eternamente
+  Causa: symlink \Device -> game: -> \Device\Harddisk0\Partition1 -> loop infinito
+  Fix: removida a symlink \Device do OnBeforeLoadXex()
+
+[RESOLVIDO] Ordinal errado para NtCreateFile
+  Sintoma: crashes silenciosos (KeBugCheckEx era chamado no lugar de NtCreateFile)
+  Causa: 0x53 = KeBugCheckEx, não NtCreateFile (NtCreateFile = 0xD2)
+  Fix: corrigido ordinal nos stubs do OnBeforeLoadXex e no OnPostSetup
+
+[RESOLVIDO] \Device\Image falha na VFS
+  Sintoma: threads em 82F333F8 (loop de verificação STFS) recebiam STATUS_NOT_FOUND
+  Causa: rexkerneld VFS divide o path em device+path antes de checar symlinks
+  Fix: tratado em TranslatePath() em file_hooks.cpp
+
+[RESOLVIDO] Duplicate symbol __imp__NtCreateFile e __imp__IoDismountVolumeByFileHandle
+  Sintoma: lld-link: error: duplicate symbol: __declspec(dllimport) _NtCreateFile
+  Causa: __imp__NtCreateFile colide com thunk de ntdll.lib E com rexkerneld.lib
+  Fix: adicionado ao CMakeLists.txt:
+       target_link_options(umvc3_recomp PRIVATE "LINKER:/FORCE:MULTIPLE")
+
+[RESOLVIDO] assert_always() em xboxkrnl_info.cpp linha 706
+  Sintoma: NtQueryVolumeInformationFile crash/assert no XFileFsDeviceInformation
+  Causa: rexkerneld.lib não implementa o case 4 (XFileFsDeviceInformation)
+  Fix: override completo via PPC_HOOK(__imp__NtQueryVolumeInformationFile, ...)
+       em file_hooks.cpp - todos os cases implementados
+
+[RESOLVIDO] \Device\Harddisk0\partition0 FAILED
+  Sintoma: CreateFileA: FAILED (open) \Device\Harddisk0\partition0
+  Causa: TranslatePath não tratava paths \Device\Harddisk0\*
+  Fix: bloco adicionado em TranslatePath para Partition1->game_dir, outros->game_dir
+
+================================================================================
+8. ESTADO ATUAL DO RUNTIME (2026-03-02 - sessão 9)
+================================================================================
+
+OK  Build compila sem erros (duplicate-symbol warnings esperados e corretos)
+OK  XEX carrega (default.xex abre corretamente)
+OK  Runtime inicializa: SDL, GPU (D3D12, AMD RX 7900 XT), áudio
+OK  VdSwap #1-#11+ confirmados (run de 11s, 09:35:35 a 09:35:46)
+OK  VdSwap #1: ring1 processado CORRETAMENTE pelo CP (off_ring=145, write_ptr=162) ✅
+OK  Double-buffering: fb_phys alterna 0x166c0000 ↔ 0x16a60000 por frame
+OK  Shaders, render targets e pipelines D3D12 criados (logs confirmados sessão 7+)
+OK  boot/0000.arc ABRE: 79KB CACHED (jogo progride)
+OK  Game loop vivo ~11 segundos (XamInputGetCapabilities @ 60Hz)
+OK  VEH: null-execute → null_ppc_func_stub, READ AV → on-demand commit
+OK  ctr=0x82ecad68 null-execute: ELIMINADO (sub_82ECAD68 gerado pelo codegen) ✅
+
+BLOQUEANTE  "PRIMARY RINGBUFFER: Failed to execute packet" — VdSwap #2, #4-#11
+            CAUSA RAIZ IDENTIFICADA (sessão 9): stale write_ptr_index_ residual
+            do frame anterior faz o CP processar ring_novo[0..write_ptr_velho)
+            prematuramente após Resume() — ver seção 24 para diagnóstico completo.
+            FIX: adicionar UpdateWritePointer(0) após InitializeRingBuffer e
+            antes de Resume() em VdSwap.
+
+BLOQUEANTE  null-execute lr=0x82cc2b14 ctr=0x0badf00d
+            GPU interrupt callback (0x82cc2ae0) faz bctrl com ctr=0x0badf00d.
+            VEH captura → null_ppc_func_stub → r3=0. Game continua.
+            Impacto: frame signaling via callback pode ser incompleto.
+
+PENDENTE    GPU: Write to unknown register (0081, 0082, 1E4E)
+PENDENTE    XMA: Write to unknown register (0601) — spam de áudio init
+
+================================================================================
+22. SESSÃO 7 — FINDINGS E ESTADO (2026-03-01)
+================================================================================
+
+--- PROGRESSO SESSÃO 7 ---
+  Antes da sessão: root.arc double-nativeXenon, vtable=null, processo terminava após VdSwap #1
+  Após sessão 7:   root.arc abre, vtable=0x82059248, game loop VIVO por 4+ segundos!
+
+--- FIXES CONFIRMADOS ATIVOS ---
+
+[OK] S6-D - double-nativeXenon RESOLVIDO
+  re-registered d:/D: -> game: (post-xex-load) confirmado no log.
+  root.arc: d:\Recomp\assets\nativeXenon/sa/X360/root.arc (116KB CACHED)
+  VFS log mostra: \Device\Harddisk0\Partition1\nativeXenon\sa\X360\root.arc (SEM double)
+
+[OK] S6-E - NtOpenFile hook ATIVO
+  root.arc está sendo aberto via CreateFileA (nosso hook completo) - funciona.
+
+[OK] S6-F - vtable 0x08E80000 → RESOLVIDO
+  Antes: null (singleton não construído). Agora: vtable=0x82059248 VÁLIDA!
+  6 workers: obj_ptr=0x40005720 vtable=0x82059248 fn=0x8277d6c8
+  sub_82F2A2D8 fix (sessão 6) desbloqueou a construção do singleton!
+
+--- ANÁLISE: SUB_82B953D8 FALLBACK ---
+  16 chamadas de fallback para __imp__sub_82B953D8 durante init.
+  A função aloca no heap físico (0xB6000000-0xBE000000 range).
+  Tamanhos: 0x12c0, 0x60, 0x20, 0x8000, 0x400000, 0x1000, 0x2000, 0x4 (pad?),
+           0xFC, 0xC8, 0x2000, 0x398000 (x3), 0x398000 (x3), etc.
+  A "fallback" indica que é o stub antigo ainda ativo. Precisa investigar se
+  essas alocações são para GPU/shader buffers e se precisam de impl real.
+  Por ora: funcionando correctamente (alocações no heap físico do jogo).
+
+--- ANÁLISE: NULL-EXECUTE EM 0x82CC2B14 (ctr=0x0badf00d) ---
+  O GPU interrupt callback (0x82cc2ae0) é chamado de VdSwap com r3=1, r4=usd.
+  Dentro do callback, em 0x82cc2b14, o código faz bctrl com ctr=0x0badf00d.
+  0x0badf00d é o valor sentinel "BADFOOD" do Xbox 360/rexkerneld para regiões
+  de memória não inicializadas.
+  CAUSA: algum campo de estrutura no callback GPU não foi inicializado pelo ctor
+  do singleton (porque o ctor rodou com stubs parciais). O campo 0-init deve ser
+  um ponteiro de função que ainda não foi populado.
+  IMPACTO ATUAL: VEH captura → null_ppc_func_stub → r3=0 → callback continua.
+  POSSÍVEL CAUSA DE PARADA: se o r3=0 retornado for interpretado como STATUS_UNSUCCESSFUL
+  e o game loop reagir saindo.
+
+--- ANÁLISE: NULL-EXECUTE EM 0x82EA77E0 (ctr=0x82ecad68) ---
+  lr=0x82ea77e0 indica que a função que faz a chamada está em ~0x82ea77dc.
+  ctr=0x82ecad68 é um endereço PPC real (no range do XEX 0x82000000-0x83FFFFFF).
+  Mas PPC_LOOKUP_FUNC(base, 0x82ecad68) retorna null.
+  HIPÓTESE: 0x82ecad68 é endereço de função PPC que foi compilada mas está em um
+  segmento/thunk não incluído na tabela de recomp. Ou é uma função de vtable
+  que não foi gerada pelo codegen.
+  OCORRE 3x CONSECUTIVOS com r4 mudando: 0x7018d4c0, 0x7018d3d0, 0x7018d3d0
+  (0x7018d3d0 e 0x7018d4c0 são endereços no range GPU 0x70000000)
+  Isto sugere um loop de processamento de texturas/render targets.
+
+--- TAREFAS SESSÃO 7 ---
+
+[X] S7-A - Atualizar prd.txt com estado atual (ESTA SESSÃO)
+
+[ ] S7-B - Investigar 0x82ecad68: função não no recomp
+  Verificar se existe PPC_STUB para esse endereço.
+  Se não: o jogo está chamando uma função que o codegen não gerou.
+  Verificar em umvc3_recomp_config.toml se há exclusões ou se o endereço está
+  no range do XEX mas em chunk não gerado.
+  AÇÃO: grep em generated/ por "82ecad68" ou "82ecad"
+  
+  ANÁLISE FEITA (sessão 7):
+  0x82ECAD68 = sub_82ECAD50 + 0x18 bytes (MID-FUNCTION, não entry point)
+  Tabela init: { 0x82ECAD50, sub_82ECAD50 } e { 0x82ECAD80, sub_82ECAD80 }
+  0x82ECAD68 não está registrado → PPC_LOOKUP_FUNC retorna null.
+  O game carrega 0x82ecad68 como ponteiro de função (vtable slot?) em 0x82ea77dc.
+  Chamado 3x com r4=0x7018d4c0/0x7018d3d0 (GPU range) → loop de render targets.
+  FIX CANDIDATO: registrar 0x82ECAD68 como entry point de sub_82ECAD50
+  via umvc3_recomp_config.toml (extra_functions ou similar) OU adicionar
+  PPC_STUB(__imp__sub_82ECAD68) que delega para sub_82ECAD50. Mas cuidado:
+  chamar mid-function pode corromper contexto. Investigar o disassembly para
+  ver se 0x82ECAD68 é um local entry point legítimo (padrão PPC64 ELFv2 ABI).
+
+[ ] S7-C - Investigar ctr=0x0badf00d no GPU callback (0x82cc2b14)
+  Dentro do callback, a estrutura apontada tem um campo não inicializado.
+  Pode ser necessário stub ou no-op dessa sub-função específica.
+  AÇÃO: adicionar log em VdSwap para capturar se o callback retorna erro persistente.
+
+[ ] S7-D - Verificar por quanto tempo o game loop permanece vivo
+  Rodar com prazo maior e verificar se processo termina ou permanece.
+  XamInputGetCapabilities spam é sinal de game loop ativo.
+  AÇÃO: rodar sem timeout e verificar log após 30s.
+
+[ ] S7-E - GPU registers desconhecidos: 0081, 0082, 1E4E
+  0081 = 0x80010000 (repetido): comum em init GPU
+  0082 = 0x00000000: companion de 0081
+  1E4E = 0x00000000: único
+  Verificar em Xenia source se esses registros têm implementação conhecida.
+
+[ ] TASK 6 - VdSwap continuado (múltiplos frames)  [PARCIALMENTE RESOLVIDO - VdSwap #1 OK]
+[ ] TASK 7 - Janela gráfica com conteúdo (META FINAL)
+
+
+
+================================================================================
+9. ANÁLISE DA SESSÃO 3 — FINDINGS E SUSPEITAS
+================================================================================
+
+--- FINDING 1: base muda entre runs ---
+  Sessão 2: base = 0x100000000
+  Sessão 3: base = 0x200000000
+  CAUSA: rexkerneld aloca virtual_membase_ com VirtualAlloc(NULL, 8GB, MEM_RESERVE)
+         sem endereço fixo — depende de ASLR/layout da sessão. NÃO é um bug,
+         mas todas as notas históricas de "host = base + 0x82BEDD34" precisam
+         ser interpretadas como relativas, não absolutas.
+  IMPACTO: nenhum (os overrides usam `base` como variável, não valor hardcoded).
+
+--- FINDING 2: VEH instalado mas crash igual (BEX64) ---
+  O WER de 14:02:43 tem o MESMO tipo (BEX64, c0000005) dos runs anteriores.
+  PORÉM o "fault module offset" mudou:
+    Antes: offset=0x0000000000000000 (rip=0 direto)
+    Agora:  P7: PCH_42_FROM_ntdll+0x00000000001625A4
+  Isso implica que a execução chegou DENTRO do ntdll antes de crashar.
+  HIPÓTESE A: VEH capturou o null-execute, redirecionou para safe_thread_abort()
+              que chama ExitThread(1). ExitThread no contexto de um VEH handler
+              pode causar corrupção de estado SEH do ntdll → segunda exceção →
+              BEX64 relatada pelo WER (ntdll).
+  HIPÓTESE B: safe_thread_abort() usa [[noreturn]] + ExitThread mas o compilador
+              gerou epilogue inválido; o stack frame do VEH callback fica corrompido.
+  HIPÓTESE C: O crash não é o null-execute do sub_827A4C48 / sub_82F32098 —
+              é outra exceção dentro de ntdll, talvez por stack overflow ou
+              heap corruption causada pelo nosso override de sub_82F32098.
+
+--- FINDING 3: sub_82F32098 override provavelmente QUEBRADO ---
+  Nossa implementação chama __savegprlr_28 / __restgprlr_28 como funções
+  standalone do meio de outro PPC_FUNC_IMPL. Essas funções são "save/restore
+  non-volatile registers" e assumem que são chamadas no PRÓLOGO/EPÍLOGO de uma
+  única função PPC continuamente. Chamar __savegprlr_28, modificar ctx.r1 (stack
+  pointer guest), depois fazer operações complexas, depois __restgprlr_28 em
+  contexto diferente quase certamente corrompe o stack guest.
+  SUSPEITA PRINCIPAL: o crash em ntdll é stack corruption gerado pelo nosso
+  override de sub_82F32098 quando os sub_827A4C48 threads chamam sub_82F236D8.
+
+--- FINDING 4: Deadlock estrutural (raiz do problema de sessão 3) ---
+  Para o singleton em 0x08E80007 ser construído, o main thread precisa executar
+  código de inicialização. O main thread provavelmente submete jobs para a fila
+  gerenciada por sub_827A5BD0 que incluem a construção do objeto.
+  sub_827A5BD0 está STUBBADO por nós → nunca processa esses jobs →
+  main thread fica esperando confirmação de job → vtable nunca escrita →
+  sub_8277DA68 threads ficam em spin-wait infinito.
+  CONCLUSÃO: sub_827A5BD0 NÃO pode ser stubbado. Ele precisa rodar de verdade.
+
+--- FINDING 5: sub_827A4C48 provável causa do crash em 2s ---
+  3 threads (ctx=0,1,2) chamam sub_827A4C48 → sub_82F236D8 → sub_82F32098.
+  Nossa override de sub_82F32098 tem bugs (ver Finding 3).
+  Se o override corrompe o stack guest, a thread pode vazar para código inválido.
+  Sem log visível (rodamos com --log_level info, os debugs estavam suprimidos).
+
+================================================================================
+10. PLANO DE AÇÃO — PRÓXIMA SESSÃO
+================================================================================
+
+STEP 1 — Reverter overrides problemáticos
+  Remover PPC_FUNC_IMPL(__imp__sub_82F32098): implementação com __savegprlr/restgprlr
+  é frágil. sub_82F32098 SEM override já funciona via rexkerneld (KeDelayExecutionThread
+  → NtWaitForSingleObjectEx). O problema era apenas o crash de PPC_CALL_INDIRECT_FUNC(0).
+
+  Remover PPC_FUNC_IMPL(__imp__sub_827A5BD0): ERRADO stubbá-lo. Ele é um worker real
+  de job dispatch que precisa rodar para o main thread progredir.
+
+STEP 2 — Consertar o VEH (null-execute guard)
+  O VEH está correto em princípio mas safe_thread_abort() pode estar causando
+  crash secundário dentro do ntdll. Substituir ExitThread(1) por:
+    TerminateThread(GetCurrentThread(), 1)  // mais agressivo, sem SEH cleanup
+  OU melhor: verificar se o crash é de facto rip=0 antes de ajustar condição.
+  Adicionar log ANTES de redirecionar para garantir que VEH está sendo chamado.
+
+STEP 3 — Entender o verdadeiro crash de sub_827A4C48 (os 3 threads ctx=0,1,2)
+  Rodar com --log_level debug e filtrar por "sub_82F32098" para ver se os
+  null-handle sleeps disparam. Se sim, o problema é só o stack corruption do
+  override. Se não, o crash está em outra função chamada antes de sub_82F32098.
+  
+  Olhar sub_827A3350 (chamado em 827A4D80 antes do PPC_CALL_INDIRECT_FUNC):
+    // mr r5,r31   (job task object)
+    // mr r4,r27   (queue struct)
+    // addi r3,r1,80 (stack slot)
+    // bl 0x827A3350
+    // lwz r10,40(r11)  <- vtable+40 do job task!
+    // mtctr r10
+    // bctrl  <- CRASH SE r10=0
+  O PPC_CALL_INDIRECT_FUNC em 827A4D98 lê vtable+40 do job task object.
+  Se o job task object está na memória física (0xA0000000-0xBFFFFFFF) e não
+  foi inicializado (zeros), vtable = 0 → vtable+40 = AV.
+
+STEP 4 — Verificar se sub_827A3350 pode ter null-check
+  Se sub_827A3350 retorna um bool indicando "job task é válido", e a chamada
+  falha graciosamente, o crash pode ser evitado sem override.
+  Olhar o código de sub_827A3350 para ver se ela já faz null-check interno.
+
+STEP 5 — Alternativamente: investigar MmAllocatePhysicalMemory
+  A memória em 0xB7220060 (ctx passado para sub_827A5BD0) está no range físico
+  0xA0000000-0xBFFFFFFF. Essa alocação é feita por MmAllocatePhysicalMemory do
+  jogo. Se rexkerneld não commita as páginas corretamente (bug já identificado:
+  NtAllocateVirtualMemory retorna X_STATUS_INVALID_PARAMETER para xGuestXex),
+  as páginas ficam zeradas e qualquer leitura de vtable retorna 0.
+  Verificar: adicionar wrapper em __imp__MmAllocatePhysicalMemory para logar
+  chamadas e verificar se as alocações retornam endereços válidos.
+
+================================================================================
+11. OVERRIDES ATIVOS EM game_patches.cpp (sessão 6)
+================================================================================
+
+PPC_FUNC_IMPL(__imp__sub_82F2A2D8)    ✅ CORRIGIDO NA SESSÃO 6
+  Antes: NO-OP total → bloqueava HAL init, VdSetGraphicsInterruptCallback nunca chamado.
+  Agora: itera lista de observers (list sentinel = 0x830F9D3C, cap = 256 iterações),
+         pula nós com fn_ptr=0, chama PPC_CALL_INDIRECT_FUNC para fn_ptr!=0.
+         EnterCriticalSection / LeaveCriticalSection ao redor da iteração.
+  RESULTADO: fn_ptr=0x82f18668 sendo chamado (confirmado no log!).
+             VdSwap #1 com buffer REAL (0x100a7244) — PROGRESSO MASSIVO.
+             Interrupt callback 0x82cc2ae0 registrado e disparado em VdSwap #1.
+  RISCO RESIDUAL: outros observadores ainda não registrados podem crashar.
+
+PPC_FUNC_IMPL(__imp__sub_82F333F8)    ✅ CORRETO, funcionando
+  Skip do observer loop, chama thread start function real, termina com ExTerminateThread.
+
+PPC_FUNC_IMPL(__imp__sub_8277DA68)    ✅ CORRETO, spin-wait ativo (vtable ainda null)
+  Mirror translate 0x88→0x08, tag strip &~0x7, spin-wait vtable até ~2s depois abort.
+  6 worker threads entram. Vtable de 0x08E80000 ainda null.
+  Timeout reduzido de 5min para ~2s (evita travar o run).
+
+PPC_FUNC_IMPL(__imp__sub_82B39AD8)    ✅ type registry lookup (suprime log spam)
+
+PPC_FUNC_IMPL(__imp__VdSetGraphicsInterruptCallback)  ✅ captura callback
+  Captura callback PPC (0x82cc2ae0) e user_data em globais atomic.
+  Confirmado chamado antes de VdSwap #1 (HAL init funcionando após fix de sub_82F2A2D8).
+
+PPC_FUNC_IMPL(__imp__VdSwap)          ✅ PM4 + interrupt callback dispatch
+  VdSwap #1: buffer=0x100a7244 (REAL). Callback 0x82cc2ae0 disparado com r3=1,r4=usd.
+
+PPC_FUNC_IMPL(__imp__VdInitializeRingBuffer)    ✅ NO-OP
+PPC_FUNC_IMPL(__imp__VdEnableRingBufferRPtrWriteBack)  ✅ NO-OP
+
+VEH NullExecuteVEH                    ✅ CORRETO
+  EXECUTE AV @ 0 → redirect RIP para null_ppc_func_stub (r3=0, continua)
+  READ AV → on-demand VirtualAlloc; se fail → flush spdlog + crash
+  WRITE AV → flush spdlog + crash
+
+--- OVERRIDES ATIVOS EM file_hooks.cpp (sessão 6) ---
+
+PPC_HOOK(__imp__NtReadFile, XNtReadFile_entry)        ✅ NOVO SESSÃO 6
+  Usa LookupObject<XNativeFile> em vez de LookupObject<XFile>.
+  Razão: rexkerneld NtReadFile tentava LookupObject<XFile> mas nossas handles são
+  bd::XNativeFile (kObjectType=100), causando type mismatch e XamShowDirtyDiscErrorUI.
+  Suporta cached/ramdisk/fstream. Sinaliza XEvent se event_handle != 0.
+
+PPC_HOOK(__imp__NtOpenFile, XNtOpenFile_entry)        ✅ NOVO SESSÃO 6
+  root.arc e outros arcs do jogo são abertos via NtOpenFile (syscall nativa Xbox 360).
+  rexkerneld VFS resolvia via symlink d:→game:\nativeXenon causando double nativeXenon.
+  Hook: delega para XNtCreateFile_entry com CreateDisposition=FILE_OPEN(1).
+  Razão: NtOpenFile não existia nos nossos hooks, só NtCreateFile. O fallback ia
+  para rexkerneld que usava o VFS com symlink quebrado.
+
+PPC_HOOK(rex_NtCreateFile, XNtCreateFile_entry)       ✅ existia, mantido
+PPC_HOOK(__imp__NtQueryVolumeInformationFile, ...)    ✅ existia, mantido
+PPC_HOOK(__imp__NtDeviceIoControlFile, ...)           ✅ existia, mantido
+PPC_HOOK(__imp__NtQueryInformationFile, ...)          ✅ existia, mantido
+
+--- OVERRIDES ADICIONADOS EM game_patches.cpp (SESSÃO 6 - object_table fix) ---
+
+// Instâncias explícitas de ObjectTable::LookupObject<T> — força símbolo FORTE
+// para vencer o template COMDAT fraco compilado em rexkerneld.lib (que tinha
+// assert_true em vez de REXLOG_WARN + return nullptr).
+namespace rex::system::util {
+template object_ref<rex::system::XThread>         ObjectTable::LookupObject<rex::system::XThread>(rex::X_HANDLE);
+template object_ref<rex::system::XEvent>          ObjectTable::LookupObject<rex::system::XEvent>(rex::X_HANDLE);
+template object_ref<rex::system::XMutant>         ObjectTable::LookupObject<rex::system::XMutant>(rex::X_HANDLE);
+template object_ref<rex::system::XSemaphore>      ObjectTable::LookupObject<rex::system::XSemaphore>(rex::X_HANDLE);
+template object_ref<rex::system::XFile>           ObjectTable::LookupObject<rex::system::XFile>(rex::X_HANDLE);
+template object_ref<rex::system::XTimer>          ObjectTable::LookupObject<rex::system::XTimer>(rex::X_HANDLE);
+template object_ref<rex::system::XIOCompletion>   ObjectTable::LookupObject<rex::system::XIOCompletion>(rex::X_HANDLE);
+template object_ref<rex::system::XEnumerator>     ObjectTable::LookupObject<rex::system::XEnumerator>(rex::X_HANDLE);
+template object_ref<rex::system::XNotifyListener> ObjectTable::LookupObject<rex::system::XNotifyListener>(rex::X_HANDLE);
+template object_ref<rex::system::XSymbolicLink>   ObjectTable::LookupObject<rex::system::XSymbolicLink>(rex::X_HANDLE);
+}
+// bd::XNativeFile instância: já existe em file_hooks.cpp/file.cpp
+// NOTA: bd::XNativeFile::kObjectType = 100 (não conflita com XFile::kObjectType = 3)
+
+[X] TASK S6-A - ObjectTable assert dialog (object_table.h:52) — CONCLUÍDA
+    Sintoma: "object->type() == T::kObjectType" MSVC assert.
+    Causa: rexkerneld.lib compilado com versão antiga de object_table.h que tinha
+    assert_true() no LookupObject<T>. Template COMDAT fraco → lib ganhava sobre
+    auto-instantiação. Nossa versão patched tem REXLOG_WARN + return nullptr.
+    Fix: instâncias explícitas de template em game_patches.cpp (símbolos FORTES
+    batem o COMDAT fraco da lib).
+
+[X] TASK S6-B - XamShowDirtyDiscErrorUI / dirty disc error — CONCLUÍDA
+    Sintoma: após fix S6-A, nova falha: LookupObject type mismatch
+    "handle=0xf800009c actual_type=100 expected_type=3" → XamShowDirtyDiscErrorUI.
+    Causa: rexkerneld NtReadFile chamava LookupObject<XFile> (type=3) mas nossas
+    handles são bd::XNativeFile (type=100).
+    Fix: override PPC_HOOK(__imp__NtReadFile, XNtReadFile_entry) em file_hooks.cpp.
+    Usa LookupObject<bd::XNativeFile> corretamente.
+
+[X] TASK S6-C - sub_82F2A2D8 NO-OP para chamar fn_ptr válidos — CONCLUÍDA
+    Fix: itera lista de observers, pula fn_ptr=0, chama fn_ptr!=0.
+    Resultado: HAL init completa, VdSetGraphicsInterruptCallback registrado antes
+    de VdSwap #1. Buffer real (0x100a7244) usado no VdSwap.
+
+[ ] TASK S6-D - root.arc VFS double-nativeXenon — RESOLVIDO NA SESSÃO 7
+    CONFIRMADO: d:\nativeXenon\sa\X360\root.arc abre corretamente (116KB CACHED).
+    VFS log: \Device\Harddisk0\Partition1\nativeXenon\sa\X360\root.arc (sem double).
+    re-registered d:/D: -> game: confirmado no log de sessão 7.
+
+[ ] TASK S6-E - NtOpenFile hook — CONFIRMADO FUNCIONANDO
+    root.arc sendo aberto via CreateFileA com path traduzida corretamente.
+
+[X] TASK S6-F - vtable 0x08E80000 — RESOLVIDO NA SESSÃO 7
+    vtable=0x82059248 VÁLIDA! Workers executam fn=0x8277d6c8.
+    sub_82F2A2D8 fix (sessão 6) foi a causa raiz da resolução.
+
+[ ] TASK S6-G - Processo termina após VdSwap #1 — PARCIALMENTE RESOLVIDO
+    Game loop VIVO por 4+ segundos! XamInputGetCapabilities em loop.
+    Processo pode ainda terminar eventualmente — verificar com run mais longo.
+
+[ ] TASK 8 - sub_8277DA68 vtable spin — RESOLVIDO NA SESSÃO 7
+    vtable=0x82059248 VÁLIDA confirmada no log de sessão 7.
+    Workers executam fn=0x8277d6c8 corretamente (não mais spin infinito).
+
+[ ] TASK 6 - VdSwap continuado (múltiplos frames)
+    VdSwap #1 com buffer real — grande progresso! Agora fixar root.arc/exit.
+
+[ ] TASK 7 - Janela gráfica com conteúdo (META FINAL)
+
+[X] TASK 1 - NtDeviceIoControlFile IOCTL 0x24400 (CONCLUÍDA sessão anterior)
+[X] TASK 3 - XeKeys stubs (CONCLUÍDA sessão anterior)
+[X] TASK 2 - sub_82F333F8 crash (CONCLUÍDA sessão anterior)
+[X] TASK S5-A - physical_membase commit (CONCLUÍDA sessão 5)
+[X] TASK S5-B - VdInitializeRingBuffer no-op (CONCLUÍDA sessão 5)
+[X] TASK S5-C - VdEnableRingBufferRPtrWriteBack no-op (CONCLUÍDA sessão 5)
+[X] TASK S5-D - VdSetGraphicsInterruptCallback captura callback (CONCLUÍDA sessão 5)
+
+================================================================================
+14. PADRÃO DE OVERRIDE DE FUNÇÕES KERNEL
+================================================================================
+
+OPÇÃO A - via PPC_HOOK em file_hooks.cpp (PREFERIDO para funções complexas):
+  static ppc_u32_result_t MinhaFuncao_entry(ppc_u32_t arg1, ...) {
+      using rex::X_STATUS;
+      using rex::be;
+      // implementação
+      return X_STATUS_SUCCESS;
+  }
+  PPC_HOOK(__imp__NomeDaFuncao, MinhaFuncao_entry)
+  // REQUER "LINKER:/FORCE:MULTIPLE" no CMakeLists.txt
+
+OPÇÃO B - via PPC_FUNC_IMPL em main.cpp (para retornos simples):
+  extern "C" {
+    PPC_FUNC_IMPL(__imp__NomeDaFuncao) {
+      ctx.r3.u64 = 0; // valor de retorno em r3
+    }
+  }
+  // REQUER "LINKER:/FORCE:MULTIPLE" no CMakeLists.txt
+
+OPÇÃO C - stub PPC via OnBeforeLoadXex (mais simples, para valor fixo):
+  stub_module("xboxkrnl", 0xNN, return_value);
+  // Injeta: lis r3,high; ori r3,r3,low; blr
+  // Limitação: não consegue acessar argumentos ou fazer lógica
+
+================================================================================
+15. ARQUIVOS CHAVE E RESPONSABILIDADES
+================================================================================
+
+src/main.cpp
+  - Umvc3RecompApp (subclasse de rex::ReXApp)
+  - OnBeforeLoadXex(): VFS symlinks, stub_module() para XAM/xboxkrnl
+    + stub_module("xboxkrnl", 0x256, 0)  [XeKeysConsolePrivateKeySign]
+    + stub_module("xboxkrnl", 0x257, 0)  [XeKeysConsoleSignatureVerification]
+  - OnPostSetup(): InitNativeHeap, InitFileHooks, object type patching
+  - Kernel overrides: __imp__NtCreateFile, __imp__IoDismountVolumeByFileHandle
+  - STUB_S macro: stubs para funções NetDll/Xam sem implementação
+  - g_vulkan_bootstrapper: força backend Vulkan antes do init gráfico
+  NOTA: D3D12 está sendo usado (AMD RX 7900 XT detectada), não Vulkan.
+
+src/bdengine/file_hooks.cpp
+  - TranslatePath(): traduz paths Xbox -> filesystem host
+    (trata \Device\Image, \Device\Harddisk0\PartitionN, device:\ paths)
+  - XCreateFileA_entry(): CreateFile nativo com VFS
+  - XNtCreateFile_entry(): NtCreateFile com suporte a \Device\Image
+  - XNtQueryVolumeInformationFile_entry(): override completo (fix linha 706)
+  - XNtDeviceIoControlFile_entry(): bypass IOCTL 0x24400 disc-auth [NOVO]
+  - XNtQueryInformationFile_entry(): override completo info classes [NOVO]
+  - InitFileHooks(): inicializa g_game_dir e g_save_dir
+  - PPC_HOOK(...) no final: linha 934-949 (CRT hooks), 1037 (Volume), 1117 (IOCTL), 1298 (QueryInfo)
+  - #include <rex/system/info/file.h> adicionado [NOVO]
+
+src/bdengine/file.h
+  - XNativeFile: wrapper fstream/cached blob/ramdisk
+  - position(): retorna posição atual [NOVO]
+  - file_size(): retorna tamanho do arquivo [NOVO]
+
+src/bdengine/game_patches.cpp
+  - CVars: bd_wireframe, bd_camera_bbox, bd_debug_menu
+  - VEH: NullExecuteVEH + InstallNullExecuteGuard() (instalado em InitGamePatches)
+         EXECUTE AV @ 0 → redirect RIP para null_ppc_func_stub (r3=0, continua)
+         READ AV → on-demand VirtualAlloc; WRITE AV → log FATAL + crash
+  - g_gpu_interrupt_callback / g_gpu_interrupt_user_data (atomic<uint32_t>)
+    Capturados por VdSetGraphicsInterruptCallback, usados em VdSwap para simular VBlank
+  - PPC_FUNC_IMPL(__imp__sub_82F2A2D8): NO-OP (observer notification loop)
+  - PPC_FUNC_IMPL(__imp__sub_82F333F8): skip observers, chama thread fn real
+  - PPC_FUNC_IMPL(__imp__sub_8277DA68): mirror translate + vtable spin-wait 5min
+  - PPC_FUNC_IMPL(__imp__sub_82B39AD8): type registry lookup (silencioso)
+  - PPC_FUNC_IMPL(__imp__VdSetGraphicsInterruptCallback): captura callback PPC
+  - PPC_FUNC_IMPL(__imp__VdSwap): PM4_XE_SWAP + dispatch GPU interrupt callback
+  - PPC_FUNC_IMPL(__imp__VdInitializeRingBuffer): NO-OP (ptr=0x4 garbage)
+  - PPC_FUNC_IMPL(__imp__VdEnableRingBufferRPtrWriteBack): NO-OP (ptr=0x10 garbage)
+
+CMakeLists.txt
+  - target_link_options(... "LINKER:/FORCE:MULTIPLE")  <- CRÍTICO para overrides
+  - target_compile_definitions(... REX_SOFT_ASSERT_ALWAYS=1) <- evita crash
+  - REXSDK_DIR aponta para d:\Recomp\rexglu
+
+================================================================================
+16. REFERÊNCIAS
+================================================================================
+
+- rexglue-sourceCODE/: source do SDK (verificar implementações de referência)
+- ref/RB2-main/: Rock Band 2 recomp (padrão de código bem estabelecido)
+- ref/reblue-main/: outro recomp de referência
+- xenia.log: log do Xenia rodando o jogo (estado de referência dourada)
+  -> Xenia abre completamente, gera shaders, monta achievements, VdSwap funciona
+- rexglu/include/rex/kernel/xboxkrnl/xboxkrnl_table.inc: tabela de ordinals
+
+Busca de ordinals:
+  Select-String "NtCreateFile|0x0D2" d:\Recomp\rexglu\include\rex\kernel\xboxkrnl\xboxkrnl_table.inc
+
+Headers úteis do SDK:
+  rex/ppc/context.h    -> PPCContext, PPC_FUNC_IMPL, PPC_STORE_U32
+  rex/ppc/function.h   -> PPC_HOOK, PPC_STUB, PPC_STUB_RETURN
+  rex/ppc/types.h      -> ppc_u32_t, ppc_pvoid_t, ppc_ptr_t<T>, ppc_u32_result_t
+  rex/system/xtypes.h  -> X_STATUS, X_STATUS_SUCCESS, X_STATUS_INVALID_HANDLE...
+  rex/system/xio.h     -> X_IO_STATUS_BLOCK, X_OBJECT_ATTRIBUTES
+  rex/system/info/volume.h -> X_FILE_FS_VOLUME_INFORMATION, XFileFsDeviceInformation
+  rex/system/info/file.h   -> XFileBasicInformation, XFileStandardInformation...
+
+================================================================================
+17. ANÁLISE TÉCNICA: SUB_82F333F8 / SUB_82F2A2D8 (thread crash)
+================================================================================
+
+sub_82F333F8 = xapi_thread_startup
+  Endereço guest: 0x82F333F8
+  Tipo: PPC_WEAK_FUNC (sobreponível por símbolo forte)
+  Chamado por: todas as threads worker criadas pelo MT Framework via ExCreateThread.
+  Argumento: r3 = start_address (guest addr), r4 = start_context
+
+  Sequência original (broken):
+    1. bl  sub_82F2A2D8  [r3=1  -> notifica "thread starting"]
+    2. mtctr r30         [r30 = start_address salvo]
+    3. mr  r3, r29       [r29 = start_context salvo]
+    4. bctrl             [PPC_CALL_INDIRECT_FUNC(ctr) = chama thread real]
+    5. bl  sub_82F2A2D8  [r3=0  -> notifica "thread done"]
+    6. bl  ExTerminateThread
+
+sub_82F2A2D8 = thread observer notification loop
+  Endereço guest: 0x82F2A2D8
+  Itera lista encadeada de observers (doubly-linked) a partir de addr ~0x8309DD7C
+    (calculado: lis r11,-31984 → 0x82400000 área, + offset 25248 = 0x8309DD7C aprox)
+  Para cada nó: lê fn_ptr = PPC_LOAD_U32(r11 + 8), chama PPC_CALL_INDIRECT_FUNC
+  PROBLEMA: no boot, a lista tem pelo menos 1 nó com fn_ptr = 0 (não inicializado).
+  CRASH: PPC_LOOKUP_FUNC(base, 0) retorna nullptr → AV execute @ rip=0x0.
+  Dump confirmado: code=c0000005 (AV), type=Execute, rip=0x0000000000000000.
+
+FIXME em game_patches.cpp:
+  PPC_FUNC_IMPL(__imp__sub_82F333F8) {
+    // aloca frame de -128 bytes (como o original)
+    // se start_address != 0: ctx.ctr = start_address, ctx.r3 = start_context
+    //   PPC_CALL_INDIRECT_FUNC(ctx.ctr.u32)
+    // restaura stack
+    // __imp__ExTerminateThread(ctx, base)
+    // NÃO chama sub_82F2A2D8 (observer loop quebrado)
+  }
+
+  DETALHE CRÍTICO: #include "generated/umvc3_recomp_config.h" DEVE vir ANTES de
+  <rex/ppc/context.h>. Sem isso, PPC_CALL_INDIRECT_FUNC expande como
+  __builtin_debugtrap() (modo sem config), não como PPC_LOOKUP_FUNC(...).
+
+  O símbolo forte (PPC_FUNC_IMPL) vence o símbolo fraco (PPC_WEAK_FUNC) gerado
+  na linkagem final via /FORCE:MULTIPLE + lld-link.
+
+================================================================================
+18. SESSÃO 4 — FINDINGS E ESTADO ATUAL (2026-02-27)
+================================================================================
+
+--- PROGRESSO SESSÃO 4 ---
+  Antes da sessão: jogo crashava em ~2s com BEX64, VEH redirecionava null-execute
+  Após sessão 4:   jogo abre janela, entra no game loop, VdSwap sendo chamado
+
+--- FIXES APLICADOS NA SESSÃO 4 ---
+
+[FIX 1] Removido override de sub_82F32098 (NtWaitForSingleObjectEx wrapper)
+  Era implementado com __savegprlr_28/__restgprlr_28 standalone — INCORRETO.
+  Essas funções assumem contexto de prólogo/epílogo contínuo de função PPC.
+  Usar standalone corrompia o stack guest → crash em ntdll após 2s.
+  FIX: removido completamente. rexkerneld.lib lida com NtWaitForSingleObjectEx.
+  O null-execute resultante (handle=0) é capturado pelo VEH.
+
+[FIX 2] Removido override de sub_827A5BD0 (MT Framework physical job dispatcher)
+  Estava stubado como no-op → main thread nunca progredia (jobs nunca processados)
+  → singleton em 0x08E80007 nunca construído → sub_8277DA68 threads giram infinito.
+  FIX: removido stub. rexkerneld.lib processa a fila normalmente.
+  Null-executes resultantes são capturados pelo VEH.
+
+[FIX 3] VEH — null-execute guard (modo correto)
+  null_ppc_func_stub: avoids ExitThread() inside VEH handler (causava crash ntdll).
+  Agora: VEH redireciona RIP para &null_ppc_func_stub (função que seta r3=0 e retorna).
+  Execução CONTINUA normalmente após a instrução de call.
+  O thread NÃO é terminado — apenas o call inválido é transformado em no-op.
+  Isso é crítico: matar a main thread mata o processo inteiro.
+
+[FIX 4] VEH — logs de READ/WRITE AV como FATAL
+  AV de tipo READ (0) ou WRITE (1) são logadas com FATAL e deixadas crashar.
+  Isso facilita diagnóstico: o último log antes do crash fica visível.
+
+[FIX 5] Committed guest physical page 0
+  VirtualAlloc(virtual_membase, 0x10000, MEM_COMMIT, PAGE_READWRITE) em OnPostSetup.
+  Razão: null_ppc_func_stub retorna r3=0. O código chamador usava esse 0 como
+  endereço guest para WRITE → host = base + 0 = base = 0x100000000 (page-file backed,
+  não committed) → WRITE AV.
+  Xbox 360: guest addr 0 é RAM válida. rexkerneld reserva mas NÃO commita.
+  FIX: commitar explicitamente os primeiros 64KB (tamanho de página grande).
+
+[FIX 6] Override PPC_FUNC_IMPL(__imp__VdSwap)
+  VdSwap_entry real da rexkerneld tentava:
+    1. copy_and_swap_32_unaligned de fetch_ptr → host page não commitada → READ AV
+    2. GetPhysicalAddress → assert_true(phys != UINT32_MAX) → abort()
+  D3D init foi null-stubada (observers retornando r3=0), então o front buffer
+  texture header em 0x7018D390 tem base_address = 0. GetPhysicalAddress(0) → 0
+  mas a tradução virtual→física falha porque 0 não é um endereço físico alocado.
+  FIX: override que:
+    - Não toca fetch_ptr (evita READ AV)
+    - Preenche ring buffer com PM4 NOP packets (0x80000000) se buffer_ptr >= 0x10000
+    - Dorme 16ms por frame para simular vsync e não starvar outras threads
+    - No primeiro VdSwap, aguarda singleton em 0x82BEDD34 estar pronto
+
+--- ESTADO ATUAL (fim sessão 4) ---
+
+CONFIRMADO:
+  - VdSwap sendo chamado: buffer=0x00000004, fetch=0x7018D390, fb_ptr=0x7018D380
+  - 6 worker threads entram em sub_8277DA68
+  - Janela se abre (tela preta)
+  - sub_8277DA68 threads spinning "object at 0x08E80000 vtable=null"
+
+BLOQUEANTE — DEADLOCK ESTRUTURAL:
+  VdSwap (main thread) espera singleton (0x82BEDD34 → obj 0x08E80000 vtable != 0)
+  sub_8277DA68 workers também esperam o mesmo vtable != 0
+  O singleton é construído pelo main thread, mas o main thread está em VdSwap.
+  = DEADLOCK TOTAL.
+
+  CAUSA RAIZ: O singleton em 0x08E80000 é construído pelo static ctor runner
+  (sub_82F32180) que já rodou ANTES do game loop/VdSwap. A vtable deveria estar
+  populada ANTES do primeiro VdSwap. Se não está, o problema é que os ctors
+  não rodam ou a função de dispatch de jobs é o mecanismo de construção.
+
+--- ANÁLISE: O SINGLETON 0x08E80000 ---
+
+  global pointer: guest 0x82BEDD34 → valor = 0x88E80007
+  mirror strip: 0x88E80007 → 0x08E80007 (strip bit 0x80000000)
+  tag bits: 0x08E80007 & ~0x7 = 0x08E80000 (objeto alinhado)
+  vtable expected: PPC_LOAD_U32(0x08E80000) = ??? (sempre 0 durante os testes)
+
+  HIPÓTESE A: o job que constrói o singleton ainda não foi executado porque
+  sub_827A5BD0 (que era nostro stub) precisava rodar para processar esse job.
+  COM o stub removido: sub_827A5BD0 real roda, mas o job pode ter sido
+  submetido antes que sub_827A5BD0 estivesse pronto, ou a ordem de inicialização
+  impede a construção antes do game loop.
+
+  HIPÓTESE B: A função sub_82F32180 (static C++ ctor runner) roda durante o
+  xstart/init, e o singleton EM TEORIA deveria ser construído por um ctor.
+  Se os ctors que dependem de jobs ficaram suspensos (porque sub_827A5BD0 era
+  stub), agora que o stub foi removido, podem estar rodando.
+  MAS o VdSwap-wait introduzido é um deadlock novo: VdSwap bloqueia a main thread
+  que precisaria processar os resultados dos jobs.
+
+--- DIAGNÓSTICO DO READ AV EM host=0xB800000010 ---
+
+  Recorrente em múltiplos runs: READ AV em host=0x000000B800000010
+  Guest addr = 0xB800000010 - base... mas base é 0x100000000 → guest = 0xB800000010
+  Wait: 0xB800000010 está ACIMA de base (0x100000000)?
+  0xB800000010 < 0x100000000? NO. 0xB800000010 >> 0x100000000.
+  0xB800000010 - 0x100000000 = 0xB700000010 → guest addr 0xB700000010 (inválido, 68GB)
+  ALTERNATIVA: 0xB800000010 é host direto, mapeado em heaps_.vA0000000
+    vA0000000 range: 0xA0000000-0xBFFFFFFF → physical heap, 64k pages
+    host addr = virtual_membase + 0xA0000000 + physical_offset
+    Se virtual_membase = 0x100000000: 0x100000000 + 0xA0000000 = 0x1A0000000
+    → 0xB800000010 não bate
+  HIPÓTESE: virtual_membase = 0x100000000, e GPU Commands thread tenta
+    ler ring buffer que VdInitializeRingBuffer recebeu com endereço = 0 ou garbage.
+  VdInitializeRingBuffer_entry recebe ptr.guest_address() e chama
+    graphics_system->InitializeRingBuffer(ptr.guest_address(), size_log2).
+  Se ptr.guest_address() = 0 ou lixo, o GPU Commands thread vai ler dali.
+  A GPU Commands thread (XThread thid 3) poll o ring buffer em loop.
+  ENDEREÇO 0xB800000010: em heaps_.vA0000000 base, o host seria
+    base + 0xA0000000 = 0x1A0000000 (errado). Mas em heaps_.physical (physical_membase):
+    physical_membase = base + 0x100000000 = 0x200000000
+    physical_membase + 0xB800000010? Não faz sentido.
+  CONCLUSÃO MAIS PROVÁVEL: 0xB800000010 é host endereço que vem de um ptr
+    construído pelo game D3D/GPU com base em alocações físicas. O valor 0xB8
+    em big-endian é 0x00000010 in 32-bit = 16. O GPU Commands thread lê
+    ring buffer @ host_addr. Se VdInitializeRingBuffer foi chamado com
+    ptr = NULL (null-stub retornou 0), então GPU thread tenta ler @ NULL+0x10
+    que em host coords = 16 (sem base), causando AV.
+  FIX NECESSÁRIO: override VdInitializeRingBuffer para no-op enquanto o GPU
+    backend não está integrado, OU garantir que a primeira chamada de
+    VdInitializeRingBuffer com ptr != 0 seja a única aceita.
+
+--- OVERRIDES ATIVOS FIM SESSÃO 4 ---
+
+PPC_FUNC_IMPL(__imp__sub_82F333F8)    ✅ CORRETO, funcionando
+PPC_FUNC_IMPL(__imp__sub_8277DA68)    ✅ CORRETO mas deadlock (ver abaixo)
+PPC_FUNC_IMPL(__imp__sub_82B39AD8)    ✅ type registry lookup (sem log spam)
+PPC_FUNC_IMPL(__imp__VdSwap)          ✅ safe stub com 16ms sleep
+VEH NullExecuteVEH                    ✅ null-execute → null_ppc_func_stub (r3=0, continue)
+
+REMOVIDOS NA SESSÃO 4 (eram problemáticos):
+PPC_FUNC_IMPL(__imp__sub_82F32098)    ❌ removido (stack corruption)
+PPC_FUNC_IMPL(__imp__sub_827A5BD0)    ❌ removido (deadlock)
+PPC_FUNC_IMPL(__imp__sub_827811C8)    ❌ removido (diagnóstico concluído)
+
+--- PRÓXIMOS PASSOS (sessão 5) ---
+
+[PRIORIDADE 1] Remover o spin-wait de VdSwap no primeiro frame
+  O spin-wait causa deadlock: main thread bloqueia esperando singleton,
+  singleton depende de jobs do main thread (que está bloqueado).
+  FIX: VdSwap retorna imediatamente sempre. Só printa log nos primeiros N frames.
+  O singleton vai ser construído ao longo do tempo pelos ctors/jobs.
+  STATUS: ✅ FEITO — VdSwap não bloqueia mais. Agora dispara interrupt callback.
+
+[PRIORIDADE 2] Override VdInitializeRingBuffer e VdEnableRingBufferRPtrWriteBack
+  para no-ops enquanto não há GPU backend integrado.
+  STATUS: ✅ FEITO — ambos são no-op na sessão 5.
+
+[PRIORIDADE 3] Investigar por que vtable de 0x08E80000 nunca fica != 0
+  STATUS: ⏳ CONTINUA — vtable ainda null após 5min. Ver sessão 5 findings.
+
+[PRIORIDADE 4] object_table.h:52 assertion (T::kObjectType mismatch)
+  STATUS: ⏳ não reproduzido ainda (processo termina antes).
+
+================================================================================
+21. SESSÃO 5 — FINDINGS E ESTADO (2026-02-27)
+================================================================================
+
+--- PROGRESSO SESSÃO 5 ---
+  Antes da sessão: crash em ~5–10s na READ AV at host=0xB800000010 (GPU hang timeout)
+  Após sessão 5:   SEM READ AV at 0xB800000010. Processo termina em ~1.2s, causa nova.
+
+--- FIXES APLICADOS NA SESSÃO 5 ---
+
+[FIX S5-1] Commit da physical_membase explicitamente
+  CAUSA DO CRASH ANTERIOR: physical_membase = SEPARATE VirtualAlloc fileMapping view.
+  Vista vA0000000 (virtual_membase+0xA0000000) e vista physical_membase são dois
+  MapViewOfFile da MESMA FileMapping, mas o Windows rastreia commit POR VISTA.
+  Commitar virtual_membase+0xA0000000 NÃO commita physical_membase ← bug anterior.
+  GPU Commands thread: TranslatePhysical(garbage_ptr) = physical_membase + offset →
+  acessa página não-commitada da physical_membase view → READ AV fatal.
+  FIX: VirtualAlloc(physical_membase, 512MB, MEM_COMMIT, PAGE_READWRITE) em OnPostSetup.
+  RESULTADO: physical_membase = 0x200000000. 512MB commitados. Sem READ AV na sessão 5!
+
+[FIX S5-2] Override VdSetGraphicsInterruptCallback
+  Captura o callback PPC registrado pelo game (endereço de função PPC e user_data).
+  Quando VdSwap é chamado, dispara o callback com r3=1 (source=VBlank) para
+  simular o GPU Commands thread processando PM4_XE_SWAP e sinalizando frame done.
+  PROBLEMA ATUAL: o callback NUNCA é registrado antes do VdSwap #1 (ver abaixo).
+
+[FIX S5-3] VdInitializeRingBuffer e VdEnableRingBufferRPtrWriteBack como no-ops
+  Ring buffer ptr = 0x4 (garbage). Forwarding faz GPU Commands thread crashar.
+  GPU rptr writeback ptr = 0x10 (garbage). Forwarding faz GPU thread escrever em
+  physical_membase+0x10 → AV.
+  Ambos são mantidos como no-op: ring buffer nunca inicializado, GPU thread fica
+  no spin-wait seguro (write_ptr_index == 0xBAADF00D).
+
+--- FINDING S5-1: physical_membase é uma vista separada do FileMapping ---
+  xmemory.cpp:160: physical_membase_ = mapping_base_ + 0x100000000ull
+  mapping_base_ = virtual_membase_ = 0x100000000 (ASLR)
+  physical_membase_ = 0x200000000 (confirmado em log)
+  MapViews() cria 9 vistas MapViewOfFile da mesma FileMapping:
+    virtual_membase+0x00000000 → file offset 0x00000000  (RAM virtual 0-3GB)
+    virtual_membase+0xA0000000 → file offset 0x100000000 (physical 64k pages)
+    virtual_membase+0xC0000000 → file offset 0x100000000 (physical 16MB pages)
+    physical_membase+0x0         → file offset 0x100000000 (physical raw)
+  Commitar virtual_membase+0xA0000000 NÃO commita physical_membase+0x0:
+  são vistas diferentes mesmo apontando para os mesmos file pages.
+  CRÍTICO: sempre commitar AMBAS quando precisar acessar memória física.
+
+--- FINDING S5-2: VdSetGraphicsInterruptCallback não chamado antes de VdSwap #1 ---
+  D3D init sequence (normal):
+    1. D3D device created → inicializa XHardwareAbstractionLayer
+    2. XHardwareAbstractionLayer registra VdSetGraphicsInterruptCallback(callback, data)
+    3. Game loop começa → VdSwap chama callback para cada frame
+  D3D init quebrada (nossa situação):
+    - sub_82F2A2D8 observer notifications retornam 0 (null-stub)
+    - Observers são componentes do HAL que precisam ser notificados para completar init
+    - VdSetGraphicsInterruptCallback é chamado dentro do init do HAL
+    - HAL init nunca completa → callback nunca registrado
+    - VdSwap #1 dispara sem callback → callback = 0 → sem sinalização de frame done
+  IMPLICAÇÃO: Para o mecanismo de interrupt callback funcionar, o init D3D/HAL
+  precisa ser desbloqueado. Isso requer entender sub_82F2A2D8 melhor.
+  ALTERNATIVA: simular VdSetGraphicsInterruptCallback via manual stub call em OnPostSetup.
+
+--- FINDING S5-3: Processo termina em ~1.2s sem log FATAL ---
+  Runs anteriores (sessão 4): crash em ~5-10s com FATAL READ AV log.
+  Run atual (sessão 5): termina em ~1.2s SEM FATAL log.
+  Thread 9952 (aparenta ser o game/render thread que chama VdSwap) gera
+  null-execute storm de RetAddr=0x00007FF612A7FD1E.
+  Sequência provável:
+    1. Thread 9952 entra em loop de D3D init
+    2. Chama função PPC via ponteiro null (HAL não inicializado) → VEH redireciona
+    3. null_ppc_func_stub retorna r3=0 → chamador usa 0 como resultado
+    4. O código PPC interpreta r3=0 como "falha crítica" e encerra o processo
+    5. Processo sai com exit code "limpo" (sem AV) mas prematuramente
+  Por isso não há FATAL log: não é uma exceção, é uma saída voluntária com código 0.
+  AÇÃO: Rodar com --log_level debug e capturar thread 9952 para ver a sequência
+  de chamadas que leva à saída do processo.
+
+--- FINDING S5-4: Arquitetura de memória confirmada ---
+  virtual_membase_  = 0x100000000 (qualquer ASLR ≥ 1<<32)
+  physical_membase_ = virtual_membase_ + 0x100000000 = 0x200000000
+  Recomp confirmado com base = 0x200000000 nos logs.
+  TranslatePhysical(addr) = physical_membase_ + (addr & 0x1FFFFFFF)
+  TranslateVirtual(addr)  = virtual_membase_ + addr
+
+--- ANÁLISE: O QUE É sub_82F2A2D8 E POR QUE MATA O HAL INIT ---
+  sub_82F2A2D8 = thread observer notification dispatcher
+  Itera lista de observadores registrados (linked list em ~0x8309DD7C).
+  Para cada observador: chama fn_ptr = observer->vtable[opcode_offset].
+  Na sequência de boot:
+    - Observadores são registrados durante init de subsistemas (áudio, gráfico, etc.)
+    - sub_82F2A2D8(1) = "thread starting" → initializers são notificados
+    - sub_82F2A2D8(0) = "thread done"
+  COM sub_82F2A2D8 como no-op:
+    - Nenhum subsistema é notificado de "thread starting"
+    - HAL gráfico não recebe a notificação que permite completar sua init
+    - VdSetGraphicsInterruptCallback nunca é chamado
+  POSSÍVEL FIX: Em vez de sub_82F2A2D8 no-op completo, filtrar somente os observadores
+  com fn_ptr == 0 (lista não inicializada) e chamar os que tenham fn_ptr válido.
+
+--- ANÁLISE: CAMINHO PARA VdSetGraphicsInterruptCallback ---
+  Objetivo: garantir que o callback GPU interrupt seja registrado antes de VdSwap #1.
+  OPÇÃO A (Clean): Corrigir sub_82F2A2D8 para chamar só observadores com fn_ptr != 0.
+    + Permite que o HAL init complete normalmente
+    + Sub_82F2A2D8 já está parcialmente certa — apenas evitar fn_ptr=0 calls
+    - Pode abrir outros null-executes de outros observadores quebrados
+  OPÇÃO B (Hack): Chamar manualmente VdSetGraphicsInterruptCallback após OnPostSetup.
+    + Simples e imediato
+    - Precisamos saber o endereço da função PPC callback que o game registraria
+    - O callback PPC precisa ser correto ou causará crash quando chamado de VdSwap
+  OPÇÃO C (Symptom fix): Remover o sleep de 16ms em VdSwap quando callback=0.
+    + Processo não trava esperando callback
+    - Não resolve o problema de frame signaling; jogo ainda pode sair prematuramente
+  RECOMENDADO: OPÇÃO A — corrigir sub_82F2A2D8 para skip fn_ptr=0 e chamar fn_ptr!=0.
+
+--- OVERRIDES ATIVOS FIM SESSÃO 5 ---
+
+PPC_FUNC_IMPL(__imp__sub_82F2A2D8)              ✅ NO-OP (observer loop)
+PPC_FUNC_IMPL(__imp__sub_82F333F8)              ✅ xapi_thread_startup corrigido
+PPC_FUNC_IMPL(__imp__sub_8277DA68)              ✅ vtable dispatch + 5min spin
+PPC_FUNC_IMPL(__imp__sub_82B39AD8)              ✅ type registry (silencioso)
+PPC_FUNC_IMPL(__imp__VdSetGraphicsInterruptCallback)  ✅ captura callback
+PPC_FUNC_IMPL(__imp__VdSwap)                    ✅ PM4+interrupt callback dispatch
+PPC_FUNC_IMPL(__imp__VdInitializeRingBuffer)    ✅ NO-OP (ptr=0x4 garbage)
+PPC_FUNC_IMPL(__imp__VdEnableRingBufferRPtrWriteBack) ✅ NO-OP (ptr=0x10 garbage)
+VEH NullExecuteVEH                              ✅ null-exec redirect + READ AV fatal
+
+--- PRÓXIMOS PASSOS (sessão 6) ---
+
+[PRIORIDADE 1] Corrigir sub_82F2A2D8 para skip fn_ptr=0 mas chamar fn_ptr!=0
+  Atualmente é no-op completo, o que bloqueia o HAL init e impede o registro
+  do interrupt callback. Fix: iterar a lista de observadores, pular fn_ptr=0,
+  chamar apenas entradas válidas.
+  RISK: observadores válidos podem chamar outras coisas quebradas → mais stubs necessários.
+  CUIDADO: sub_82F2A2D8 gera 10-20 null-executes/call na lista atual. Com o fix,
+  cada observador válido executa código PPC real — pode ter novas falhas.
+
+[PRIORIDADE 2] Investigar por que processo termina em ~1.2s (thread 9952)
+  Rodar com --log_level debug e grep por "t9952" para ver sequência completa.
+  Identificar o ponto onde r3=0 (retorno de stub) causa saída do processo.
+  Provável: alguma função de init retorna STATUS_UNSUCCESSFUL (0xC0000001) que
+  é interpretada como "D3D init falhou" → ExitProcess.
+
+[PRIORIDADE 3] VdSetGraphicsInterruptCallback precisa ser chamado antes de VdSwap #1
+  Depende de [PRIORIDADE 1]. Após corrigir sub_82F2A2D8, o HAL init deve completar
+  e registrar o callback naturalmente.
+  Verificar no log: "VdSetGraphicsInterruptCallback: callback=0xXXXXXXXX" deve aparecer
+  ANTES de "VdSwap #1".
+
+[PRIORIDADE 4] VdSwap #2, #3... sem crash = jogo em game loop
+  Meta intermediária: após corrigir o init path, VdSwap deve ser chamado repetidamente
+  e o interrupt callback deve ser disparado em cada frame, mantendo o game loop vivo.
+
+================================================================================
+19. MAPA DE ENDEREÇOS GUEST CONFIRMADOS
+================================================================================
+
+0x82F333F8  sub_82F333F8    xapi_thread_startup (overridado)
+0x82F2A2D8  sub_82F2A2D8    Observer notification loop (fix sessão 6: skip fn_ptr=0)
+0x8277DA68  sub_8277DA68    Worker vtable dispatch (overridado)
+0x82BEDD34  [global]        Ponteiro para singleton MT Framework job manager
+0x88E80007  [tagged ptr]    Valor lido de 0x82BEDD34 (bits 0-2 = flags MT Framework)
+0x08E80000  [obj base]      Objeto singleton alinhado — SESSÃO 7: vtable=0x82059248 VÁLIDO!
+0x82059248  [vtable]        Vtable do singleton job manager (CONFIRMADO SESSÃO 7)
+0x8277D6C8  [fn]            Função despachada pelos workers (confirmada sessão 7)
+0x40005720  [obj_ptr]       Endereço do objeto passado para sub_8277DA68 workers
+0x40021630  [start_ctx]     Contexto de um dos workers (vários: 0x630, 0x5B0, 0x590, etc.)
+0x82F32180  sub_82F32180    Static C++ constructor runner
+0x82B39AD8  sub_82B39AD8    Type registry lookup (overridado, sem log spam)
+0x82B953D8  sub_82B953D8    Fallback alocador físico (16 chamadas durante init)
+0x82CC2AE0  [fn ptr]        GPU interrupt callback capturado por VdSetGraphicsInterruptCallback
+0x82CC2B14  [addr]          Dentro do callback GPU: faz bctrl com ctr=0x0badf00d (BADFOOD)
+0x82EA77E0  [lr]            Chamador que usa ctr=0x82ECAD68 (mid-function ptr)
+0x82ECAD50  sub_82ECAD50    Função registrada no recomp
+0x82ECAD68  [mid-func]      0x82ECAD50+0x18 — chamado como fn ptr mas não registrado!
+0x82ECAD80  sub_82ECAD80    Função registrada no recomp
+0x7018D390  [D3D data]      Fetch constant pointer (front buffer texture header)
+0x7018D380  [D3D data]      Pointer to front buffer address
+0x7018D4C0  [GPU range]     Render target/texture (passado como r4 em chamadas 0x82ea77dc)
+0x7018D3D0  [GPU range]     Render target/texture (passado como r4 em chamadas 0x82ea77dc)
+0xB6E00244  [phys buf]      buffer_ptr passado para VdSwap #1 (REAL! sessão 7)
+0x166C0000  [phys]          frontbuffer_phys (fb_phys em VdSwap #1)
+0x16E00000  [phys]          ring_phys (ring buffer físico em VdSwap #1)
+
+CONSTANTES PM4 (xenos.h):
+  PM4_XE_SWAP     = 0x64
+  kSwapSignature  = make_fourcc("SWAP") = 0x50415753
+  MakePacketType3(0x64, 4) = 0xC0036400
+  MakePacketType2()        = 0x80000000 (NOP)
+
+MEMÓRIA HOST CONFIRMADA (sessão 7):
+  virtual_membase_  = 0x100000000 (ASLR, 4GB guest window)
+  physical_membase_ = 0x200000000 (= virtual_membase + 0x100000000)
+  Guest page 0 committed @ host=0x100000000
+  Physical heap vA0000000 committed @ host=0x1A0000000
+  physical_membase 512MB committed @ host=0x200000000
+  GPU virtual range 0x70000000-0x70FFFFFF committed @ host=0x170000000
+  XEX BSS 0x83230000-0x88FFFFFF committed (1501 pages, pre-commit para singleton)
+
+================================================================================
+23. SESSÃO 8 — ANÁLISE DO RING BUFFER RACE E FIX (2026-03-01)
+================================================================================
+
+--- CAUSA RAIZ: PRIMARY RINGBUFFER Failed to execute packet ---
+
+  O erro ocorre especificamente em VdSwap #5 e #7 (e.g., 19:43:01.801, 19:43:03.549)
+  após o jogo entrar no loop com boot/0000.arc carregado.
+
+  ANÁLISE DO CÓDIGO (command_processor.cpp):
+    ExecutePrimaryBuffer(read_index, write_index):
+      reader = RingBuffer(TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_)
+      reader.set_read_offset(read_index * 4)
+      reader.set_write_offset(write_index * 4)
+      while ExecutePacket(&reader) → read_count() > 0
+      return write_index  ← <-- CHAVE DO BUG
+
+    WorkerThreadMain(): read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index)
+    InitializeRingBuffer(): read_ptr_index_ = 0  [NÃO ATÔMICO com ExecutePrimaryBuffer!]
+
+  SEQUÊNCIA DO RACE (frame N → frame N+1):
+    THREAD CP (t13316):
+      1. Está dentro de ExecutePrimaryBuffer(0, 4363) processando frame N (ring4)
+         → usa local RingBuffer com primary_buffer_ptr_=ring4 (capturado no início)
+    THREAD MAIN (VdSwap #N+1, t28344):
+      2. Chama InitializeRingBuffer(ring5, sl2)
+         → read_ptr_index_ := 0, primary_buffer_ptr_ := ring5  [não-atômico!]
+      3. Chama UpdateWritePointer(4523) → escreve write_ptr_index_=4523, seta evento
+    THREAD CP continua:
+      4. ExecutePrimaryBuffer(0, 4363) retorna 4363
+         → read_ptr_index_ = 4363  ← SOBRESCREVE o 0 de InitializeRingBuffer!
+      5. CP loop: write_ptr=4523, read_ptr=4363 (stale do frame N!)
+         → ExecutePrimaryBuffer(4363, 4523) on primary_buffer_ptr_=ring5
+         → ring5 PM4 começa em offset 0; 4363 é MID-STREAM de frame N+1!
+         → Lê pacote no meio de um TYPE3 de multi-dwords → read_count overflow
+         → return false → "PRIMARY RINGBUFFER: Failed to execute packet"
+
+  EVIDÊNCIA NO LOG:
+    - 19:43:01.782: WriteRegister index out of bounds: 32767 (CP ainda no frame N)
+    - 19:43:01.799: VdSwap #5 inicia (t28344)
+    - 19:43:01.800: InitializeRingBuffer(ring5) + UpdateWritePointer(4523)
+    - 19:43:01.801: **** PRIMARY RINGBUFFER: Failed to execute packet (t13316)
+    → O CP (t13316) ainda finalizava frame N quando frame N+1 foi iniciado!
+
+--- FIX IMPLEMENTADO: Pause/Resume do CP antes de InitializeRingBuffer ---
+
+  ARQUIVO: src/bdengine/game_patches.cpp (função VdSwap)
+  MUDANÇA:
+    ANTES:
+      gs->command_processor()->InitializeRingBuffer(ring_phys_frame, sl2);
+    DEPOIS:
+      gs->command_processor()->Pause();  // espera CP terminar frame atual
+      gs->command_processor()->InitializeRingBuffer(ring_phys_frame, sl2);
+      gs->command_processor()->Resume();
+
+  Pause() → CallInThread([]{Suspend()}) + Fence → espera CP processar pending_fns_
+  (após ExecutePrimaryBuffer retornar) → CP suspende com read_ptr=write_ptr correto
+  InitializeRingBuffer → safe: read_ptr_index_=0, primary_buffer_ptr_=ring_novo
+  Resume() → unsuspend CP thread
+  UpdateWritePointer(write_ptr_dwords) → CP acorda, processa ring novo [0..write_ptr)
+
+  RESULTADO APÓS TESTE (run 09:35:35, sessão 9):
+    VdSwap #1: SEM FALHA ✅ (Pause funcionou corretamente no primeiro frame)
+    VdSwap #2-#11: FALHA PERSISTENTE ❌ ("Failed to execute packet")
+    CAUSA: write_ptr_index_ stale do frame anterior não foi resetado.
+    Após Resume(), o CP vê write_ptr=162 (do frame 1) e read_ptr=0 (reset por InitRB).
+    Como 0 ≠ 162, o CP inicia ExecutePrimaryBuffer(0, 162) no ring novo PREMATURAMENTE.
+    Ring_novo[0..162) contém PM4 do frame N+1 que possui packets grandes (shaders, etc.)
+    que se extendem além de 162 dwords → overflow → "Failed to execute packet."
+    Ver seção 24 para causa raiz completa e fix correto.
+
+  BUILD: cmake --build d:\Recomp\out\build\win-amd64-debug (✅ 20:14:02, sem erros)
+
+--- TAREFAS SESSÃO 8 ---
+
+[X] S8-A  análise inicial da causa raiz do ring buffer race — CONCLUÍDA
+[X] S8-B  implementar Pause/Resume antes de InitializeRingBuffer — CONCLUÍDA (build OK)
+[X] S8-C  documentar em prd.txt — CONCLUÍDA
+[X] S8-D  rodar teste — CONCLUÍDO
+           RESULTADO PARCIAL: falha persiste por stale write_ptr. Ver sessão 9.
+[ ] S8-E  investigar ctr=0x0badf00d (pendente sessão 9+)
+
+================================================================================
+24. SESSÃO 9 — DIAGNÓSTICO STALE WRITE_PTR (2026-03-02)
+================================================================================
+
+--- LOG DE REFERÊNCIA (run 09:35:35 → 09:35:46) ---
+
+  VdSwap #1 (t22896, ring1=0x16e00000): write_ptr=162  → SEM FALHA ✅
+  VdSwap #2 (t4636, ring2=0x16e20000): write_ptr=631   → FALHA em t5800 ❌
+  VdSwap #3 (t4636, ring3=0x16e40000): write_ptr=4207  → SEM FALHA IMEDIATA (Pause longa: 1.3s)
+  VdSwap #4 (t4636, ring4=0x16e60000): write_ptr=4363  → FALHA em t5800 ❌
+  VdSwap #5 (t4636, ring5=0x16e80000): write_ptr=4523  → FALHA 617ms depois ❌
+  VdSwap #6-#11: falhas em todos ← jogo continua mas CP nunca processa frames completos
+
+--- DIAGNÓSTICO: POR QUE Pause/Resume NÃO RESOLVEU ---
+
+  EXPECTATIVA (sessão 8): Pause() espera CP terminar → InitializeRingBuffer(ring_novo)
+  → read_ptr=0, buf=ring_novo → Resume() → CP acorda → UpdateWritePointer(X) → CP
+  processa ring_novo[0..X) corretamente.
+
+  PROBLEMA REAL: Pause/Resume foi implementado corretamente, MAS write_ptr_index_
+  NÃO FOI RESETADO. Ao resumir, o CP vê:
+    - read_ptr_index_ = 0         (resetado por InitializeRingBuffer ✅)
+    - write_ptr_index_ = VALOR_DO_FRAME_ANTERIOR (NÃO resetado! ❌)
+  
+  Como read_ptr(=0) != write_ptr(=valor_velho), o CP IMEDIATAMENTE inicia:
+    ExecutePrimaryBuffer(0, valor_velho) no ring_novo
+
+--- SEQUÊNCIA DO RACE (frame N → frame N+1): ---
+
+  FRAME 1 (ring1, write_ptr=162):
+    CP processa ring1[0..162) → read_ptr_index_ = 162. CP fica idle.
+
+  VDSWAP #2 CHAMA:
+    1. Pause()                   → CP suspenso (read=write=162)
+    2. InitializeRingBuffer(ring2) → read_ptr=0, buf=ring2
+    3. Resume()                  → CP acorda
+       ★ write_ptr_index_ ainda é 162 (do frame 1)!
+       ★ read_ptr(0) ≠ write_ptr(162) → CP inicia ExecutePrimaryBuffer(0, 162) em ring2!
+    4. [código escreve PM4 em buffer_guest]
+    5. UpdateWritePointer(631)   → CP já está processando ring2[0..162)
+
+  DURANTE STEP 3:
+    - CP processa ring2[0..162)
+    - Ring2 tem 614 dwords do jogo; o frame 2 começa com packets grandes
+      (e.g., PM4_IM_LOAD_IMMEDIATE com count=200 dwords, mas janela = apenas 162)
+    - ExecutePacketType3 detecta: read_count < count*4 → return false
+    - "PRIMARY RINGBUFFER: Failed to execute packet" ← AQUI
+
+  DEPOIS DO STEP 5 (UpdateWritePointer(631)):
+    - CP retomou de onde falhou (read_ptr vai para 162 por causa do return value)
+    - ExecutePrimaryBuffer(162, 631) → processa ring2[162..631) incluindo XE_SWAP
+    - IssueSwap executa mas com estado de shader INCOMPLETO (perdemos ring2[0..162)!)
+
+--- PROVA NO LOG ---
+
+  VdSwap #2: "ring slice switch" a 09:35:37.542 (Pause começa)
+  VdSwap #2: "write_ptr=631" a 09:35:37.551 (9ms para Pause+InitRB+Resume+escrita PM4)
+  VdSwap #2: "firing GPU interrupt callback" a 09:35:37.552
+  VdSwap #2: "Failed to execute packet" a 09:35:37.552 (1ms após UpdateWritePointer!)
+  ↑ O CP iniciou prematuramente ring2[0..162) com write_ptr stale e falhou
+
+  VdSwap #3 (Pause 1.3s): a demora é o Pause() esperando o CP terminar ring2[162..631)
+  que incluiu compilação de shaders D3D12 (criação de render targets, pipelines, etc.)
+
+--- FIX CORRETO: UpdateWritePointer(0) ANTES de Resume() ---
+
+  ARQUIVO: src/bdengine/game_patches.cpp (função VdSwap, bloco inicialização ring)
+
+  ANTES (sessão 8 — Pause/Resume sem reset de write_ptr):
+    gs->command_processor()->Pause();
+    gs->command_processor()->InitializeRingBuffer(ring_phys_frame, sl2);
+    gs->command_processor()->Resume();
+    // ... escrita dos PM4 ...
+    gs->command_processor()->UpdateWritePointer(write_ptr_dwords);
+
+  DEPOIS (FIX sessão 9):
+    gs->command_processor()->Pause();
+    gs->command_processor()->InitializeRingBuffer(ring_phys_frame, sl2);
+    gs->command_processor()->UpdateWritePointer(0);  // ← NOVO: reseta write_ptr para 0
+    gs->command_processor()->Resume();
+    // ... escrita dos PM4 ...
+    gs->command_processor()->UpdateWritePointer(write_ptr_dwords);  // acorda CP com range correto
+
+  POR QUÊ FUNCIONA:
+    - Após InitializeRingBuffer: read_ptr=0, buf=ring_novo
+    - UpdateWritePointer(0): write_ptr=0 (= read_ptr) → CP fica idle ao resumir
+    - Resume(): CP acorda, vê read_ptr(0)==write_ptr(0) → vai para idle-wait
+    - [código escreve PM4 no ring]
+    - UpdateWritePointer(write_ptr_real): CP acorda, processa ring_novo[0..write_ptr_real)
+      em UMA PASSAGEM COMPLETA, sem nenhum truncamento ou overflow
+
+  EFEITO COLATERAL DE UpdateWritePointer(0) enquanto CP está suspenso:
+    - write_ptr_index_event_->Set() — seta o evento, mas CP está suspenso (Suspend)
+    - Quando Resume() é chamado, CP retoma executando (não está em Wait)
+    - Na próxima iteração do loop principal: pending_fns_ vazio, write==read==0 → idle
+    - Safe ✅
+
+--- TAREFAS SESSÃO 9 ---
+
+[X] S9-A  análise do stale write_ptr — CONCLUÍDA
+           (diagnóstico já feito; ver seção acima)
+[ ] S9-B  implementar UpdateWritePointer(0) antes de Resume() em VdSwap
+           ARQUIVO: src/bdengine/game_patches.cpp
+           BUSCA:   gs->command_processor()->Resume();
+           INSERIR ANTES: gs->command_processor()->UpdateWritePointer(0);
+           Depois: cmake --build d:\Recomp\out\build\win-amd64-debug --target umvc3_recomp
+[ ] S9-C  rodar teste e confirmar que "Failed to execute packet" sumiu
+           FILTRO LOG: Get-Content d:\Recomp\recomp.log | Select-String "Failed|VdSwap"
+[ ] S9-D  após S9-C: verificar se IssueSwap produz imagem válida
+           FILTRO LOG: Get-Content d:\Recomp\recomp.log | Select-String "IssueSwap|RequestSwap|fetch0"
+[ ] S9-E  investigar ctr=0x0badf00d no GPU callback (lr=0x82cc2b14)
+           ANÁLISE CONHECIDA: campo struct user_data+10900+16 = 0x0BADF00D (não-init)
+           VEH já trata. Próximo passo: identificar qual struct tem o campo vazio e
+           preencher com endereço de função PPC de no-op.
+
+================================================================================
+20. NOTAS DE IMPLEMENTAÇÃO: TAGGED POINTERS MT FRAMEWORK
+================================================================================
+
+MT Framework usa "tagged pointers" em vários ponteiros de objetos:
+  - Os 3 bits baixos (bits 0-2) são usados como flags/metadados
+  - O endereço real do objeto = ptr & ~0x7u (alinhamento mínimo de 8 bytes)
+
+Exemplo confirmado:
+  PPC_LOAD_U32(0x82BEDD34) = 0x88E80007
+  Mirror translate: & ~0x80000000 = 0x08E80007
+  Tag strip: & ~0x7 = 0x08E80000  ← vtable do objeto está aqui
+
+sub_8277DA68 CORRIGIDO para usar `uint32_t obj_ptr = global_ptr & ~0x7u` antes
+de ler a vtable. O dispatch usa global_ptr (com tags) em r3 como esperado
+pelo callee.
+
+================================================================================
