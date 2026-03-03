@@ -2,3 +2,10 @@
 /ref
 /rexglu
 /rexglue-sourceCODE
+
+# Build outputs
+/out
+/build
+*.exe
+*.pdb
+*.zip
